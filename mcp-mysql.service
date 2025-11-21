@@ -1,0 +1,16 @@
+[Unit]
+Description=MCP MySQL Server
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/mcp_mysql
+Environment="PATH=/opt/mcp_mysql/venv/bin"
+EnvironmentFile=/opt/mcp_mysql/.env
+ExecStart=/opt/mcp_mysql/venv/bin/python -m mcp_mysql.server
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

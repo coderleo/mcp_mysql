@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  mcp-mysql:
+    build: .
+    container_name: mcp-mysql
+    restart: always
+    ports:
+      - "7056:7056"
+    environment:
+      - MYSQL_HOST=rm-2zef3g69a3cr7z46pfo.mysql.rds.aliyuncs.com
+      - MYSQL_PORT=3306
+      - MYSQL_USER=aivisitor
+      - MYSQL_PASSWORD=4mQz6leq
+      - MYSQL_DATABASE=ai_gamec
+      - QUERY_TIMEOUT=30
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=7056
+    # 或使用 env_file
+    # env_file:
+    #   - .env
