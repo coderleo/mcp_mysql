@@ -1,8 +1,8 @@
 """
-MCP Server for MySQL Database Connections and Queries
+MCP MySQL 服务器（连接与查询）
 
-This module provides a Model Context Protocol (MCP) server that enables
-connections to MySQL databases and execution of SQL queries via SSE.
+本模块提供一个 Model Context Protocol (MCP) 服务器，允许通过 SSE
+与 MySQL 数据库建立连接并执行 SQL 查询。
 """
 
 import os
@@ -94,7 +94,7 @@ class MySQLPoolManager:
         - 该方法是阻塞的；在异步环境中应通过 `asyncio.to_thread` 将其移到
           线程池执行以避免阻塞事件循环。
         """
-        # Validate that query is a SELECT statement
+        # 验证查询是以 SELECT 开头的语句
         query_upper = query.strip().upper()
         if not query_upper.startswith('SELECT'):
             logger.warning(f"拒绝执行非 SELECT 查询: {query[:50]}...")
@@ -121,7 +121,7 @@ class MySQLPoolManager:
         try:
             conn = self.pool.get_connection()
             cursor = conn.cursor(dictionary=True)
-            # Set query timeout in milliseconds
+            # 将查询超时设置为毫秒
             cursor.execute(f"SET SESSION max_execution_time={effective_timeout * 1000}")
 
             logger.info(f"执行查询 (超时: {effective_timeout}秒): {query[:100]}...")
@@ -150,7 +150,7 @@ class MySQLPoolManager:
                     pass
             if conn:
                 try:
-                    conn.close()  # return to pool
+                    conn.close()  # 返回连接到连接池（或关闭连接）
                 except Exception:
                     pass
     
@@ -168,9 +168,9 @@ def get_db_connection() -> MySQLPoolManager:
     - 懒初始化 `MySQLPoolManager` 并创建连接池，使用环境变量配置连接参数。
     - 返回单例的 `MySQLPoolManager` 以便在进程内复用池资源。
 
-    English:
-    Get or create the pooled DB manager. Lazily initializes the global
-    MySQLPoolManager using environment variables for configuration.
+    说明：
+    - 懒初始化 `MySQLPoolManager` 并使用环境变量配置连接参数创建连接池。
+    - 返回进程内可复用的单例 `MySQLPoolManager`。
     """
     global db_connection
     if db_connection is None:
