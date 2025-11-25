@@ -13,6 +13,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 import mysql.connector
 from mysql.connector import Error
+from mysql.connector import pooling
 from mcp.server import Server
 
 # 加载 .env 文件中的环境变量
@@ -32,51 +33,66 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class MySQLConnection:
-    """Manages MySQL database connections."""
-    
-    def __init__(self, host: str, port: int, user: str, password: str, database: str, query_timeout: int = 30):
+class MySQLPoolManager:
+    """MySQL 连接池管理器（同步客户端）。
+
+    管理基于 `mysql.connector.pooling.MySQLConnectionPool` 的连接池，提供
+    同步的 `execute_query` 方法。由于 MCP 服务器是异步的，调用方应
+    在协程中通过 `asyncio.to_thread` 将该同步方法移到线程池中执行。
+    """
+
+    def __init__(self, host: str, port: int, user: str, password: str, database: str,
+                 query_timeout: int = 30, pool_size: int = 5):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
         self.database = database
         self.query_timeout = query_timeout
-        self.connection = None
-    
+        self.pool_size = pool_size
+        self.pool: Optional[pooling.MySQLConnectionPool] = None
+
     def connect(self):
-        """Establish connection to MySQL database."""
+        """创建连接池并初始化。成功返回 True，失败抛出异常。
+
+        中文说明: 使用实例化时提供的配置信息创建 `MySQLConnectionPool`。
+        """
         try:
-            logger.info(f"正在连接到 MySQL: {self.host}:{self.port}/{self.database}")
-            self.connection = mysql.connector.connect(
+            logger.info(f"创建 MySQL 连接池: {self.host}:{self.port}/{self.database} (size={self.pool_size})")
+            self.pool = pooling.MySQLConnectionPool(
+                pool_name="mcp_pool",
+                pool_size=self.pool_size,
                 host=self.host,
                 port=self.port,
                 user=self.user,
                 password=self.password,
                 database=self.database
             )
-            logger.info("MySQL 连接成功")
+            logger.info("MySQL 连接池创建成功")
             return True
         except Error as e:
-            logger.error(f"MySQL 连接失败: {e}")
-            raise Exception(f"Error connecting to MySQL: {e}")
-    
+            logger.error(f"创建连接池失败: {e}")
+            raise Exception(f"Error creating MySQL pool: {e}")
+
     def disconnect(self):
-        """Close the database connection."""
-        if self.connection and self.connection.is_connected():
-            self.connection.close()
-    
+        """断开/清理连接池（尽力而为）。
+
+        中文说明: mysql.connector 的池不提供显式关闭方法，这里只是
+        将内部引用置空以便垃圾回收；对于大多数应用，让进程退出
+        即可释放资源。
+        """
+        self.pool = None
+
     def execute_query(self, query: str, timeout: Optional[int] = None) -> dict[str, Any]:
-        """执行 SELECT 查询并返回结果，支持超时控制。
-        
-        Args:
-            query: 要执行的 SELECT 查询语句
-            timeout: 查询超时时间（秒），默认使用实例配置的超时时间
-        
-        Returns:
-            成功时: {"success": True, "data": [...]}
-            失败时: {"success": False, "error_code": "...", "message": "..."}
-            超时时: {"success": False, "error_code": "TIMEOUT", "message": "...", "timeout_seconds": 30}
+        """使用池中的连接执行 SELECT 查询（同步方法）。
+
+        中文说明:
+        - 只允许执行以 SELECT 开头的查询；否则返回错误结构并拒绝执行。
+        - 从连接池获取连接，设置会话级查询超时（`max_execution_time`），
+          执行查询并返回结果（列表形式，字典字段）。
+        - 如果出现数据库错误，返回带有 `error_code` 与 `message` 的结构。
+        - 该方法是阻塞的；在异步环境中应通过 `asyncio.to_thread` 将其移到
+          线程池执行以避免阻塞事件循环。
         """
         # Validate that query is a SELECT statement
         query_upper = query.strip().upper()
@@ -87,9 +103,9 @@ class MySQLConnection:
                 "error_code": "INVALID_QUERY",
                 "message": "仅允许执行 SELECT 查询"
             }
-        
+
         try:
-            if not self.connection or not self.connection.is_connected():
+            if not self.pool:
                 self.connect()
         except Exception as e:
             return {
@@ -97,28 +113,26 @@ class MySQLConnection:
                 "error_code": "CONNECTION_ERROR",
                 "message": f"数据库连接失败: {str(e)}"
             }
-        
-        # Use provided timeout or fall back to instance timeout
+
         effective_timeout = timeout if timeout is not None else self.query_timeout
-        
-        cursor = self.connection.cursor(dictionary=True)
+
+        conn = None
+        cursor = None
         try:
-            # Set query timeout
-            cursor.execute(f"SET SESSION max_execution_time={effective_timeout * 1000}")  # MySQL timeout in milliseconds
-            
-            # Execute the actual query
+            conn = self.pool.get_connection()
+            cursor = conn.cursor(dictionary=True)
+            # Set query timeout in milliseconds
+            cursor.execute(f"SET SESSION max_execution_time={effective_timeout * 1000}")
+
             logger.info(f"执行查询 (超时: {effective_timeout}秒): {query[:100]}...")
             cursor.execute(query)
             results = cursor.fetchall()
             logger.info(f"查询成功，返回 {len(results)} 行数据")
-            return {
-                "success": True,
-                "data": results
-            }
+            return {"success": True, "data": results}
         except Error as e:
             error_msg = str(e)
-            # Check if it's a timeout error
-            if "max_execution_time" in error_msg.lower() or "timeout" in error_msg.lower():
+            if "max_execution_time" in error_msg.lower() or "timeout" in error_msg.lower() \
+                or "time exceeded" in error_msg.lower():
                 logger.warning(f"查询超时 ({effective_timeout}秒): {query[:50]}...")
                 return {
                     "success": False,
@@ -127,23 +141,37 @@ class MySQLConnection:
                     "timeout_seconds": effective_timeout
                 }
             logger.error(f"数据库错误: {e}")
-            return {
-                "success": False,
-                "error_code": "DATABASE_ERROR",
-                "message": f"执行查询时出错: {str(e)}"
-            }
+            return {"success": False, "error_code": "DATABASE_ERROR", "message": f"执行查询时出错: {str(e)}"}
         finally:
-            cursor.close()
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()  # return to pool
+                except Exception:
+                    pass
     
 
 
 
-# Global MySQL connection
-db_connection: Optional[MySQLConnection] = None
+# Global MySQL pool manager
+db_connection: Optional[MySQLPoolManager] = None
 
 
-def get_db_connection() -> MySQLConnection:
-    """Get or create database connection."""
+def get_db_connection() -> MySQLPoolManager:
+    """获取或创建全局的 MySQL 连接池管理器。
+
+    中文说明:
+    - 懒初始化 `MySQLPoolManager` 并创建连接池，使用环境变量配置连接参数。
+    - 返回单例的 `MySQLPoolManager` 以便在进程内复用池资源。
+
+    English:
+    Get or create the pooled DB manager. Lazily initializes the global
+    MySQLPoolManager using environment variables for configuration.
+    """
     global db_connection
     if db_connection is None:
         host = os.getenv("MYSQL_HOST", "localhost")
@@ -151,12 +179,13 @@ def get_db_connection() -> MySQLConnection:
         user = os.getenv("MYSQL_USER", "root")
         password = os.getenv("MYSQL_PASSWORD", "")
         database = os.getenv("MYSQL_DATABASE", "")
-        query_timeout = int(os.getenv("QUERY_TIMEOUT", "30"))
-        
-        logger.info(f"创建数据库连接: {user}@{host}:{port}/{database}")
-        db_connection = MySQLConnection(host, port, user, password, database, query_timeout)
+        query_timeout = int(os.getenv("QUERY_TIMEOUT", "15"))
+        pool_size = int(os.getenv("POOL_SIZE", "20"))
+
+        logger.info(f"创建数据库连接池管理: {user}@{host}:{port}/{database}")
+        db_connection = MySQLPoolManager(host, port, user, password, database, query_timeout, pool_size)
         db_connection.connect()
-    
+
     return db_connection
 
 
@@ -217,7 +246,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     
     try:
         db = get_db_connection()
-        result = db.execute_query(sql)
+        # execute_query is synchronous (uses mysql.connector); run in thread
+        result = await asyncio.to_thread(db.execute_query, sql)
         return [TextContent(
             type="text",
             text=json.dumps(result, indent=2, ensure_ascii=False, default=str)
@@ -237,29 +267,37 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
 # ASGI application combining SSE and message handling
 async def mcp_asgi_app(scope, receive, send):
-    """Main ASGI application for MCP server."""
+    """ASGI 主应用，处理 SSE 与消息路由。
+
+    中文说明:
+    - 处理来自 HTTP 的请求，根据 `scope['path']` 与方法路由到 SSE
+      端点或消息端点。
+    - 对于 `/sse` 建立 SSE 连接并驱动 MCP `Server` 的读取/写入流。
+    - 对于 `/messages` 处理 POST 消息交付给 SSE 传输层。
+    """
     if scope["type"] == "http":
         path = scope["path"]
         method = scope["method"]
-        
+
         if path == "/sse" and method == "GET":
             # Handle SSE connection
             client = scope.get('client')
             client_host = client[0] if client else "未知"
             logger.info(f"SSE 连接建立: 客户端 {client_host}")
-            
+
             async with sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
                 await app.run(
                     read_stream,
                     write_stream,
                     app.create_initialization_options()
                 )
-        
+
         elif path == "/messages" and method == "POST":
             # Handle POST messages
-            logger.debug("收到 POST 消息")
+            logger.info("收到 POST 消息")
+
             await sse_transport.handle_post_message(scope, receive, send)
-        
+
         else:
             # 404 Not Found
             await send({
@@ -278,31 +316,40 @@ starlette_app = mcp_asgi_app
 
 
 async def main():
-    """Main entry point for the MCP SSE server."""
+    """应用启动入口：配置并运行 uvicorn 服务器。
+
+    中文说明:
+    - 读取环境变量 `MCP_HOST` 和 `MCP_PORT`，打印启动信息并启动
+      uvicorn 以运行 ASGI 应用 `starlette_app`。
+    """
     import uvicorn
-    
+
     host = os.getenv("MCP_HOST", "0.0.0.0")
     port = int(os.getenv("MCP_PORT", "8000"))
-    
-    logger.info("="*50)
+
+    logger.info("=" * 50)
     logger.info("MCP MySQL 服务器启动中...")
     logger.info(f"服务器地址: http://{host}:{port}")
     logger.info(f"SSE 端点: http://{host}:{port}/sse")
     logger.info(f"消息端点: http://{host}:{port}/messages")
-    logger.info("="*50)
-    
+    logger.info("=" * 50)
+
     config = uvicorn.Config(
         starlette_app,
         host=host,
         port=port,
-        log_level="info"
+        log_level="info",
     )
     server = uvicorn.Server(config)
     await server.serve()
 
 
 def run():
-    """Run the SSE server."""
+    """启动服务器的同步包装函数。
+
+    中文说明: 在同步上下文中调用此函数会运行 asyncio 事件循环并启动
+    MCP SSE 服务器（等价于 `python -m mcp_mysql.server` 的行为）。
+    """
     asyncio.run(main())
 
 
