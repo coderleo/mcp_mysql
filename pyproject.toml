@@ -11,6 +11,7 @@ dependencies = [
     "uvicorn>=0.23.0",
     "sse-starlette>=1.6.0",
     "python-dotenv>=1.0.0",
+    "fastmcp>=2.13.1",
 ]
 
 [project.scripts]
